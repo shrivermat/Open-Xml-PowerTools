@@ -37,6 +37,7 @@ using System.Xml.Linq;
 using System.Collections.Generic;
 using DocumentFormat.OpenXml.Packaging;
 using System.Drawing;
+using DocumentFormat.OpenXml.Drawing.Diagrams;
 
 namespace OpenXmlPowerTools
 {
@@ -148,6 +149,63 @@ namespace OpenXmlPowerTools
                 document.Save(partXmlWriter);
             part.RemoveAnnotations<XDocument>();
             part.AddAnnotation(document);
+        }
+
+        public static void AddXDocument(this SlidePart part, XDocument document)
+        {
+
+            using (Stream partStream = part.GetStream(FileMode.Create, FileAccess.Write))
+            using (XmlWriter partXmlWriter = XmlWriter.Create(partStream))
+                document.Save(partXmlWriter);
+            var currentDocument = part.Annotation<XDocument>();
+
+            var destinationChildren = currentDocument.Descendants(P.cNvPr);
+            var sourceChildren = document.Descendants(P.nvSpPr);
+
+            int highestId = 0;
+
+
+            foreach (var currentChild in destinationChildren)
+            {
+
+                var idAttribute = currentChild.Attribute("id");
+                if (idAttribute != null)
+                {
+                    int id = 0;
+                    var success = int.TryParse(idAttribute.Value, out id);
+                    if (success && id > highestId)
+                    {
+                        highestId = id;
+                    }
+                }
+            }
+
+            foreach (var currentChild in sourceChildren)
+            {
+                var cNvPr = currentChild.Descendants(P.cNvPr).FirstOrDefault();
+                if (cNvPr != null)
+                {
+                    var idAttribute = cNvPr.Attribute("id");
+                    idAttribute?.SetValue((++highestId).ToString());
+                }
+            }
+
+            var destinationSpTree = currentDocument.Descendants(P.spTree).FirstOrDefault();
+            var sourceSpTree = document.Descendants(P.spTree).FirstOrDefault();
+
+            if (destinationSpTree != null && sourceSpTree != null)
+            {
+                foreach (var xElement in sourceSpTree.Elements())
+                {
+                    if (!xElement.Name.Equals(P.nvGrpSpPr) && !xElement.Name.Equals(P.grpSpPr))
+                    {
+                        destinationSpTree.Add(xElement);
+                    }
+                }
+            }
+
+            part.RemoveAnnotations<XDocument>();
+            part.AddAnnotation(currentDocument);
         }
 
         private static XmlNamespaceManager GetManagerFromXDocument(XDocument xDocument)

@@ -32,6 +32,7 @@ using System.Linq;
 using System.Xml.Linq;
 using System.Text;
 using DocumentFormat.OpenXml.Packaging;
+using DocumentFormat.OpenXml.Presentation;
 
 namespace OpenXmlPowerTools
 {
@@ -93,33 +94,77 @@ namespace OpenXmlPowerTools
 
     public static class PresentationBuilder
     {
-        public static void BuildPresentation(List<SlideSource> sources, string fileName)
+        public static void CopySlideContentsBetweenPresentations(PmlDocument destinationDocument,
+            int destinationSlideIndex, List<SlideSource> sourceSlides, string fileName)
         {
             using (OpenXmlMemoryStreamDocument streamDoc = OpenXmlMemoryStreamDocument.CreatePresentationDocument())
             {
                 using (PresentationDocument output = streamDoc.GetPresentationDocument())
                 {
-                    BuildPresentation(sources, output);
+                    //Step one
+                    //Get all the slides that need to be merged onto one slide inside one PmlDocument as separate slides
+                    sourceSlides.Insert(0, new SlideSource(destinationDocument, destinationSlideIndex, false));
+
+                    var slidesForMergeInOneDocument = BuildPresentation(sourceSlides, false);
+
+                    //Step two
+                    //Create a new PmlDocument with just one slide and all the slides contents from step one merged onto that one
+                    var slidesToMerge = new List<SlideSource>()
+                    {
+                        new SlideSource(slidesForMergeInOneDocument, false)
+                    };
+
+                    var mergedSlides = BuildPresentation(slidesToMerge, true);
+
+                    //Step three
+                    //Create a new PmlDocument that consists of (maximally) three parts
+                    //Part one - slides in front of the destination slide
+                    //Part two - new destination slide with all the content merged
+                    //Part three - slides after the destination slide
+                    var combinedSlides = new List<SlideSource>();
+                    if (destinationSlideIndex > 0)
+                    {
+                        combinedSlides.Add(new SlideSource(destinationDocument, 0, destinationSlideIndex, false));
+                    }
+                    combinedSlides.Add(new SlideSource(mergedSlides, false));
+                    combinedSlides.Add(new SlideSource(destinationDocument, destinationSlideIndex + 1, false));
+
+                    BuildPresentation(combinedSlides, output, false);
                     output.Close();
                 }
                 streamDoc.GetModifiedDocument().SaveAs(fileName);
             }
         }
 
-        public static PmlDocument BuildPresentation(List<SlideSource> sources)
+
+
+        public static void BuildPresentation(List<SlideSource> sources, string fileName, bool mergeAllSlides = false)
         {
             using (OpenXmlMemoryStreamDocument streamDoc = OpenXmlMemoryStreamDocument.CreatePresentationDocument())
             {
                 using (PresentationDocument output = streamDoc.GetPresentationDocument())
                 {
-                    BuildPresentation(sources, output);
+                    BuildPresentation(sources, output, mergeAllSlides);
+                    output.Close();
+                }
+                streamDoc.GetModifiedDocument().SaveAs(fileName);
+            }
+        }
+
+        public static PmlDocument BuildPresentation(List<SlideSource> sources, bool mergeAllSlides = false)
+        {
+            using (OpenXmlMemoryStreamDocument streamDoc = OpenXmlMemoryStreamDocument.CreatePresentationDocument())
+            {
+                using (PresentationDocument output = streamDoc.GetPresentationDocument())
+                {
+                    BuildPresentation(sources, output, mergeAllSlides);
                     output.Close();
                 }
                 return streamDoc.GetModifiedPmlDocument();
             }
         }
 
-        private static void BuildPresentation(List<SlideSource> sources, PresentationDocument output)
+        private static void BuildPresentation(List<SlideSource> sources, PresentationDocument output, bool mergeAllSlides = false)
         {
             if (RelationshipMarkup == null)
                 RelationshipMarkup = new Dictionary<XName, XName[]>()
@@ -177,7 +222,14 @@ namespace OpenXmlPowerTools
                     {
                         if (sourceNum == 0)
                             CopyPresentationParts(doc, output, images, mediaList);
-                        currentMasterPart = AppendSlides(doc, output, source.Start, source.Count, source.KeepMaster, images, currentMasterPart, mediaList);
+                        if (mergeAllSlides)
+                        {
+                            currentMasterPart = AppendSlidesContentToOneSlide(doc, output, source.Start, source.Count, source.KeepMaster, images, currentMasterPart, mediaList);
+                        }
+                        else
+                        {
+                            currentMasterPart = AppendSlides(doc, output, source.Start, source.Count, source.KeepMaster, images, currentMasterPart, mediaList);
+                        }
                     }
                     catch (PresentationBuilderInternalException dbie)
                     {
@@ -475,6 +527,298 @@ namespace OpenXmlPowerTools
             }
             return currentMasterPart;
         }
+
+        private static SlideMasterPart AppendSlidesContentToOneSlide(PresentationDocument sourceDocument, PresentationDocument newDocument,
+    int start, int count, bool keepMaster, List<ImageData> images, SlideMasterPart currentMasterPart, List<MediaData> mediaList)
+        {
+            XDocument newPresentation = newDocument.PresentationPart.GetXDocument();
+            if (newPresentation.Root.Element(P.sldIdLst) == null)
+                newPresentation.Root.Add(new XElement(P.sldIdLst));
+            uint newID = 256;
+            var ids = newPresentation.Root.Descendants(P.sldId).Select(f => (uint)f.Attribute(NoNamespace.id));
+            if (ids.Any())
+                newID = ids.Max() + 1;
+            var slideList = sourceDocument.PresentationPart.GetXDocument().Root.Descendants(P.sldId);
+            if (slideList.Count() == 0 && (currentMasterPart == null || keepMaster))
+            {
+                var slideMasterPart = sourceDocument.PresentationPart.SlideMasterParts.FirstOrDefault();
+                if (slideMasterPart != null)
+                    currentMasterPart = CopyMasterSlide(sourceDocument, slideMasterPart, newDocument, newPresentation, images, mediaList);
+                return currentMasterPart;
+            }
+            SlidePart newSlide = newDocument.PresentationPart.AddNewPart<SlidePart>();
+            bool putDocument = true;
+            while (count > 0 && start < slideList.Count())
+            {
+                SlidePart slide = (SlidePart)sourceDocument.PresentationPart.GetPartById(slideList.ElementAt(start).Attribute(R.id).Value);
+                if (currentMasterPart == null || keepMaster)
+                    currentMasterPart = CopyMasterSlide(sourceDocument, slide.SlideLayoutPart.SlideMasterPart, newDocument, newPresentation, images, mediaList);
+
+                var sourceSlideXDocument = slide.GetXDocument();
+                if (putDocument)
+                {
+                    newSlide.PutXDocument(sourceSlideXDocument);
+                    putDocument = false;
+                }
+                else
+                {
+                    newSlide.AddXDocument(sourceSlideXDocument);
+                }
+
+                AddRelationships(slide, newSlide, new[] { newSlide.GetXDocument().Root });
+                CopyRelatedPartsForContentParts(newDocument, slide, newSlide, new[] { newSlide.GetXDocument().Root }, images, mediaList);
+                CopyTableStyles(sourceDocument, newDocument, slide, newSlide);
+                if (slide.NotesSlidePart != null)
+                {
+                    if (newDocument.PresentationPart.NotesMasterPart == null)
+                        CopyNotesMaster(sourceDocument, newDocument, images, mediaList);
+                    NotesSlidePart newPart = newSlide.AddNewPart<NotesSlidePart>();
+                    newPart.PutXDocument(slide.NotesSlidePart.GetXDocument());
+                    newPart.AddPart(newSlide);
+                    newPart.AddPart(newDocument.PresentationPart.NotesMasterPart);
+                    AddRelationships(slide.NotesSlidePart, newPart, new[] { newPart.GetXDocument().Root });
+                    CopyRelatedPartsForContentParts(newDocument, slide.NotesSlidePart, newPart, new[] { newPart.GetXDocument().Root }, images, mediaList);
+                }
+
+                string layoutName = slide.SlideLayoutPart.GetXDocument().Root.Element(P.cSld).Attribute(NoNamespace.name).Value;
+                foreach (SlideLayoutPart layoutPart in currentMasterPart.SlideLayoutParts)
+                    if (layoutPart.GetXDocument().Root.Element(P.cSld).Attribute(NoNamespace.name).Value == layoutName)
+                    {
+                        if (newSlide.SlideLayoutPart == null)
+                        {
+                            newSlide.AddPart(layoutPart);
+                        }
+                        break;
+                    }
+                if (newSlide.SlideLayoutPart == null)
+                    newSlide.AddPart(currentMasterPart.SlideLayoutParts.First());  // Cannot find matching layout part
+
+                //if (slide.SlideCommentsPart != null)
+                //    CopyComments(sourceDocument, newDocument, slide, newSlide);
+
+
+                //newID++;
+                start++;
+                count--;
+            }
+            newPresentation.Root.Element(P.sldIdLst).Add(new XElement(P.sldId,
+    new XAttribute(NoNamespace.id, newID.ToString()),
+    new XAttribute(R.id, newDocument.PresentationPart.GetIdOfPart(newSlide))));
+            return currentMasterPart;
+        }
+
+        private static void CopyContentFromOneSlideToAnother(PresentationDocument sourceDocument, int sourceSlideIndex,
+            PresentationDocument destinationDocument, int destinationSlideIndex,
+            List<ImageData> images, /*SlideMasterPart currentMasterPart,*/ List<MediaData> mediaList)
+        {
+            var sourceSlideList = sourceDocument.PresentationPart.GetXDocument().Root.Descendants(P.sldId);
+            var sourceSlide =
+                (SlidePart)
+                sourceDocument.PresentationPart.GetPartById(
+                    sourceSlideList.ElementAt(sourceSlideIndex).Attribute(R.id).Value);
+
+            var destinationSlideList = destinationDocument.PresentationPart.GetXDocument().Root.Descendants(P.sldId);
+            var destinationSlide =
+                (SlidePart)
+                destinationDocument.PresentationPart.GetPartById(
+                    destinationSlideList.ElementAt(destinationSlideIndex).Attribute(R.id).Value);
+
+            //destinationSlide.AddXDocument(sourceSlide.GetXDocument());
+
+
+    //        var destinationCommonSlideData =
+    //            destinationSlide.Slide.ChildElements.FirstOrDefault(
+    //                x => x.GetType().Equals(typeof(DocumentFormat.OpenXml.Presentation.CommonSlideData)));
+    //        var destinationChildren = destinationCommonSlideData.Descendants<NonVisualDrawingProperties>();
+    //        uint highestId = 0;
+
+    //        foreach (var destinationChild in destinationChildren)
+    //        {
+    //            var idAttribute = destinationChild.Id.Value;
+    //            if (idAttribute > highestId)
+    //            {
+    //                highestId = idAttribute;
+    //            }
+    //        }
+
+    //        var sourceCommonSlideData =
+    //sourceSlide.Slide.ChildElements.FirstOrDefault(
+    //    x => x.GetType().Equals(typeof(DocumentFormat.OpenXml.Presentation.CommonSlideData)));
+    //        var sourceChildren = sourceCommonSlideData.Descendants<NonVisualDrawingProperties>();
+
+    //        foreach (var sourceChild in sourceChildren)
+    //        {
+    //            if (sourceChild.Id.HasValue)
+    //            {
+    //                sourceChild.Id.Value = ++highestId;
+    //            }
+    //        }
+
+    //        var destinationSpTree = destinationSlide.Slide.Descendants<ShapeTree>().FirstOrDefault();
+    //        var sourceSpTree = sourceSlide.Slide.Descendants<ShapeTree>().FirstOrDefault();
+
+    //        if (destinationSpTree != null && sourceSpTree != null)
+    //        {
+    //            foreach (var xElement in sourceSpTree.Elements())
+    //            {
+
+    //                if (!xElement.GetType().Equals(typeof(NonVisualGroupShapeProperties)) && !xElement.GetType().Equals(typeof(GroupShapeProperties)))
+    //                {
+    //                    destinationSpTree.AppendChild(xElement.CloneNode(true));
+    //                }
+    //            }
+    //        }
+
+            destinationSlide.PutXDocument(sourceSlide.GetXDocument());
+
+
+            AddRelationships(sourceSlide, destinationSlide, new[] {destinationSlide.GetXDocument().Root});
+            CopyRelatedPartsForContentParts(destinationDocument, sourceSlide, destinationSlide,
+                new[] {destinationSlide.GetXDocument().Root}, images, mediaList);
+            CopyTableStyles(sourceDocument, destinationDocument, sourceSlide, destinationSlide);
+            //if (slide.NotesSlidePart != null)
+            //{
+            //    if (newDocument.PresentationPart.NotesMasterPart == null)
+            //        CopyNotesMaster(sourceDocument, newDocument, images, mediaList);
+            //    NotesSlidePart newPart = newSlide.AddNewPart<NotesSlidePart>();
+            //    newPart.PutXDocument(slide.NotesSlidePart.GetXDocument());
+            //    newPart.AddPart(newSlide);
+            //    newPart.AddPart(newDocument.PresentationPart.NotesMasterPart);
+            //    AddRelationships(slide.NotesSlidePart, newPart, new[] { newPart.GetXDocument().Root });
+            //    CopyRelatedPartsForContentParts(newDocument, slide.NotesSlidePart, newPart, new[] { newPart.GetXDocument().Root }, images, mediaList);
+            //}
+
+            //string layoutName = slide.SlideLayoutPart.GetXDocument().Root.Element(P.cSld).Attribute(NoNamespace.name).Value;
+            //foreach (SlideLayoutPart layoutPart in currentMasterPart.SlideLayoutParts)
+            //    if (layoutPart.GetXDocument().Root.Element(P.cSld).Attribute(NoNamespace.name).Value == layoutName)
+            //    {
+            //        if (newSlide.SlideLayoutPart == null)
+            //        {
+            //            newSlide.AddPart(layoutPart);
+            //        }
+            //        break;
+            //    }
+            //if (destinationSlide.SlideLayoutPart == null)
+            //{
+            //    destinationSlide.AddPart(currentMasterPart.SlideLayoutParts.First());
+            //        // Cannot find matching layout part
+            //}
+
+            //if (slide.SlideCommentsPart != null)
+            //    CopyComments(sourceDocument, newDocument, slide, newSlide);
+
+
+            //newID++;
+
+            //        newPresentation.Root.Element(P.sldIdLst).Add(new XElement(P.sldId,
+            //new XAttribute(NoNamespace.id, newID.ToString()),
+            //new XAttribute(R.id, newDocument.PresentationPart.GetIdOfPart(newSlide))));
+            //        return currentMasterPart;
+
+            //destinationSlide.PutXDocument();
+            destinationDocument.SaveAs("../../a.pptx");
+        }
+
+        //        public static void CopyContentFromOneSlideToAnother(PresentationDocument sourceDocument,
+        //int sourceSlideIndex, int destinationSlideIndex, bool keepMaster/*, List<ImageData> images, SlideMasterPart currentMasterPart, List<MediaData> mediaList*/)
+        //        {
+        //            var images=new List<ImageData>();
+        //            var mediaList=new List<MediaData>();
+
+        //            RelationshipMarkup = new Dictionary<XName, XName[]>()
+        //                {
+        //                    { A.audioFile,        new [] { R.link }},
+        //                    { A.videoFile,        new [] { R.link }},
+        //                    { A.quickTimeFile,    new [] { R.link }},
+        //                    { A.wavAudioFile,     new [] { R.embed }},
+        //                    { A.blip,             new [] { R.embed, R.link }},
+        //                    { A.hlinkClick,       new [] { R.id }},
+        //                    { A.hlinkMouseOver,   new [] { R.id }},
+        //                    { A.hlinkHover,       new [] { R.id }},
+        //                    { A.relIds,           new [] { R.cs, R.dm, R.lo, R.qs }},
+        //                    { C.chart,            new [] { R.id }},
+        //                    { C.externalData,     new [] { R.id }},
+        //                    { C.userShapes,       new [] { R.id }},
+        //                    { DGM.relIds,         new [] { R.cs, R.dm, R.lo, R.qs }},
+        //                    { A14.imgLayer,       new [] { R.embed }},
+        //                    { P14.media,          new [] { R.embed, R.link }},
+        //                    { P.oleObj,           new [] { R.id }},
+        //                    { P.externalData,     new [] { R.id }},
+        //                    { P.control,          new [] { R.id }},
+        //                    { P.snd,              new [] { R.embed }},
+        //                    { P.sndTgt,           new [] { R.embed }},
+        //                    { PAV.srcMedia,       new [] { R.embed, R.link }},
+        //                    { P.contentPart,      new [] { R.id }},
+        //                    { VML.fill,           new [] { R.id }},
+        //                    { VML.imagedata,      new [] { R.href, R.id, R.pict, O.relid }},
+        //                    { VML.stroke,         new [] { R.id }},
+        //                    { WNE.toolbarData,    new [] { R.id }},
+        //                    { Plegacy.textdata,   new [] { XName.Get("id") }},
+        //                };
+        //            //XDocument newPresentation = newDocument.PresentationPart.GetXDocument();
+        //            //if (newPresentation.Root.Element(P.sldIdLst) == null)
+        //            //    newPresentation.Root.Add(new XElement(P.sldIdLst));
+        //            //uint newID = 256;
+        //            //var ids = newPresentation.Root.Descendants(P.sldId).Select(f => (uint)f.Attribute(NoNamespace.id));
+        //            //if (ids.Any())
+        //            //    newID = ids.Max() + 1;
+        //            var slideList = sourceDocument.PresentationPart.GetXDocument().Root.Descendants(P.sldId);
+        //            //if (slideList.Count() == 0 && (currentMasterPart == null || keepMaster))
+        //            //{
+        //            //    var slideMasterPart = sourceDocument.PresentationPart.SlideMasterParts.FirstOrDefault();
+        //            //    if (slideMasterPart != null)
+        //            //        currentMasterPart = CopyMasterSlide(sourceDocument, slideMasterPart, newDocument, newPresentation, images, mediaList);
+        //            //    return currentMasterPart;
+        //            //}
+        //            //while (count > 0 && start < slideList.Count())
+        //            //{
+        //            SlidePart destinationSlide =
+        //                    (SlidePart)
+        //                    sourceDocument.PresentationPart.GetPartById(
+        //                        slideList.ElementAt(destinationSlideIndex).Attribute(R.id).Value);
+        //            SlidePart sourceSlide = (SlidePart)sourceDocument.PresentationPart.GetPartById(slideList.ElementAt(sourceSlideIndex).Attribute(R.id).Value);
+
+        //            //if (currentMasterPart == null || keepMaster)
+        //            //    currentMasterPart = CopyMasterSlide(sourceDocument, sourceSlide.SlideLayoutPart.SlideMasterPart, newDocument, newPresentation, images, mediaList);
+        //            //SlidePart newSlide = newDocument.PresentationPart.AddNewPart<SlidePart>();
+        //            //newSlide.PutXDocument(sourceSlide.GetXDocument());
+        //            AddRelationships(sourceSlide, destinationSlide, new[] { destinationSlide.GetXDocument().Root });
+        //            CopyRelatedPartsForContentParts(sourceDocument, sourceSlide, destinationSlide, new[] { destinationSlide.GetXDocument().Root }, images, mediaList);
+        //            //CopyTableStyles(sourceDocument, newDocument, sourceSlide, destinationSlide);
+        //            //if (sourceSlide.NotesSlidePart != null)
+        //            //{
+        //            //    if (newDocument.PresentationPart.NotesMasterPart == null)
+        //            //        CopyNotesMaster(sourceDocument, newDocument, images, mediaList);
+        //            //    NotesSlidePart newPart = newSlide.AddNewPart<NotesSlidePart>();
+        //            //    newPart.PutXDocument(sourceSlide.NotesSlidePart.GetXDocument());
+        //            //    newPart.AddPart(newSlide);
+        //            //    newPart.AddPart(newDocument.PresentationPart.NotesMasterPart);
+        //            //    AddRelationships(sourceSlide.NotesSlidePart, newPart, new[] { newPart.GetXDocument().Root });
+        //            //    CopyRelatedPartsForContentParts(newDocument, sourceSlide.NotesSlidePart, newPart, new[] { newPart.GetXDocument().Root }, images, mediaList);
+        //            //}
+
+        //            //string layoutName = sourceSlide.SlideLayoutPart.GetXDocument().Root.Element(P.cSld).Attribute(NoNamespace.name).Value;
+        //            //foreach (SlideLayoutPart layoutPart in currentMasterPart.SlideLayoutParts)
+        //            //    if (layoutPart.GetXDocument().Root.Element(P.cSld).Attribute(NoNamespace.name).Value == layoutName)
+        //            //    {
+        //            //        newSlide.AddPart(layoutPart);
+        //            //        break;
+        //            //    }
+        //            //if (newSlide.SlideLayoutPart == null)
+        //            //    newSlide.AddPart(currentMasterPart.SlideLayoutParts.First());  // Cannot find matching layout part
+
+        //            //if (sourceSlide.SlideCommentsPart != null)
+        //            //    CopyComments(sourceDocument, newDocument, sourceSlide, newSlide);
+
+        //            //newPresentation.Root.Element(P.sldIdLst).Add(new XElement(P.sldId,
+        //            //    new XAttribute(NoNamespace.id, newID.ToString()),
+        //            //    new XAttribute(R.id, newDocument.PresentationPart.GetIdOfPart(newSlide))));
+        //            //    newID++;
+        //            //    start++;
+        //            //    count--;
+        //            //}
+        //            //return currentMasterPart;
+        //        }
 
         private static SlideMasterPart CopyMasterSlide(PresentationDocument sourceDocument, SlideMasterPart sourceMasterPart,
             PresentationDocument newDocument, XDocument newPresentation, List<ImageData> images, List<MediaData> mediaList)

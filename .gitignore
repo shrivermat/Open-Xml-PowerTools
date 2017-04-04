@@ -30,3 +30,6 @@ TestResults/
 # NuGet Packages
 *.nupkg
 **/packages/*
+/OpenXmlPowerToolsExamples/PresentationBuilder01/a.pptx
+/OpenXmlPowerToolsExamples/PresentationBuilder01/Presentation2.pptx
+/OpenXmlPowerToolsExamples/PresentationBuilder01/Presentation1.pptx
